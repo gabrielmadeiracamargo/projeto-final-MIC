@@ -1,0 +1,47 @@
+// C++ code
+//
+volatile uint8_t flag_botao_apertado = 0;
+ISR(INT0_vect){
+  flag_botao_apertado = 1;}; 
+uint8_t Combinacao_correta = 0;
+
+
+void setup()
+{
+ Serial.begin(9600);
+ DDRB = 0b00000000; //Aqui defini os pinos de AREF até 8 como 0
+ PORTB = 0b00111100; //Aqui defini os regitradores internos de 13 a 10 como pull up
+ DDRD = 0b00000000;
+ PORTD = 0b00000100; 
+ EICRA = 0b00000010;
+ EIMSK = 0b00000001;
+ randomSeed(analogRead(A0));
+ uint8_t fio_a_ser_tirado = random(0,4);
+  if (fio_a_ser_tirado == 0){Combinacao_correta = 0b00000100;
+                            Serial.println("Sou o sangue da fornalha e o sinal de que a linha foi cruzada. O meu tom avisa onde o perigo mora, mas se a pressa falar mais alto do que a razão, a contagem regressiva silencia para sempre. Não sou o começo, mas sou o centro de toda a cautela.");}
+  if (fio_a_ser_tirado == 1){Combinacao_correta = 0b00001000;
+                            Serial.println("Brilho com a intensidade de uma estrela distante, mas não trago o calor do fogo. Aviso sobre o perigo antes que ele se torne fatal, como a centelha que antecede a tempestade. Estou entre o extremo da energia e a calmaria da terra.");}
+  if (fio_a_ser_tirado == 2){Combinacao_correta = 0b00010000;
+                            Serial.println("Nasço do encontro entre a paixão e a luz do dia, mas não pertenço totalmente a nenhuma delas. Sou o entardecer congelado em metal, o crepúsculo que avisa que o tempo está mudando. Quem busca o equilíbrio perfeito me encontra no meio do caminho.");}
+  if (fio_a_ser_tirado == 3){Combinacao_correta = 0b00100000;
+                            Serial.println("Visto o manto da meia-noite antes que a escuridão tome conta de tudo. Sou o enigma que os reis e os alquimistas guardavam em segredo, uma mistura profunda que desafia a lógica dos opostos. Quem me desvendar, precisará olhar além do óbvio.");}
+   
+ sei();// versão boas praticasEICRA |= (1 << ISC01); // Configura o bit ISC01 como 1EICRA &= ~(1 << ISC00);
+}//indentifica em borda de descida
+
+void loop()
+{
+  
+  if (flag_botao_apertado == 1){
+    Serial.print("Valor lido do PINB: ");
+    Serial.println(PINB, BIN);
+    if ((PINB & 0b00111100) == Combinacao_correta){
+      Serial.println("acertou");
+    }
+    else{
+      Serial.print("errou");
+    }
+     flag_botao_apertado = 0;
+  }
+   
+}
