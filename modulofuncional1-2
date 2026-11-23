@@ -1,0 +1,464 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h>
+
+#define set_bit(reg, bit) ((reg) |= (1 << (bit)))
+#define clr_bit(reg, bit) ((reg) &= ~(1 << (bit)))
+#define tst_bit(reg, bit) ((reg) & (1 << (bit)))
+
+#define LIMITE_SUPERIOR 360
+#define LIMITE_INFERIOR 290
+
+#define limite_enig   3
+#define total_enigmas 25
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+volatile uint8_t  flag_botao_apertado = 0;
+
+volatile uint8_t  flag_1s        = 0;
+volatile uint32_t tempo_ms       = 0;
+int16_t           tempo_restante = 300; // em segundos
+uint8_t           inicio         = 0;   // garante o funcionamento do timer
+
+uint8_t estado_atual   = 0;   // estado do modulo
+uint8_t printar_modulo = 255; // variavel para printar no monitor serial e display
+uint8_t vidas_totais   = 3;
+
+uint8_t resistor_correto = 0; // divisor de tensao
+
+uint8_t enigma_n          = 1; // qual enigma é
+//const int limite_enig = 3;    // o numero total de enigmas jogados por jogo
+//const uint8_t total_enigmas = 25; // total de enigmas possiveis
+uint8_t resposta_esperada = 0; // resposta esperada do enigma, ela compara com a resposta do jogador
+uint8_t erro_enigma       = 0;
+
+ISR(INT0_vect) { // interrupcao para o botao de confirmacao
+    static uint32_t ultimo_aperto_ms = 0;
+
+    if (tempo_ms - ultimo_aperto_ms >= 150) { // debounce de 150 ms
+        flag_botao_apertado = 1;
+        ultimo_aperto_ms = tempo_ms;
+    }
+}
+
+ISR(TIMER2_COMPA_vect) { // roda a cada 1 ms exato, timer para o tempo do jogo
+    static uint16_t contador_ms = 0;
+
+    tempo_ms++;
+    contador_ms++;
+
+    if (contador_ms >= 1000) {
+        contador_ms -= 1000;
+        flag_1s = 1;
+    }
+}
+
+uint16_t meu_analogRead(uint8_t canal) {
+    ADMUX = (1 << REFS0) | canal;  // referência 5 V + canal
+    set_bit(ADCSRA, ADSC);         // começa a conversão
+    while (tst_bit(ADCSRA, ADSC)); // espera terminar
+    return ADC;                    // resultado: 0 a 1023
+}
+
+void inicio_jogo() { // para iniciar o jogo
+    Serial.println(F("Digite '&' armar a bomba:"));
+    lcd.print(F("Digite & para jogar:"));
+
+    while (1) {
+        if (Serial.available() > 0) {
+            char tecla = Serial.read();
+            if (tecla == '&') {
+                break;
+            }
+        }
+    }
+}
+
+void reset_jogo() { // resetar o jogo
+    Serial.println(F("Digite 'r' para resetar:"));
+
+    while (1) {
+        if (Serial.available() > 0) {
+            char tecla = Serial.read();
+            if (tecla == 'r' || tecla == 'R') {
+                wdt_enable(WDTO_15MS);
+                while (1);
+            }
+        }
+    }
+}
+
+void tempo_display() { // timer do tempo total do jogo
+    if (tempo_restante > 0) {
+        if (flag_1s) {
+            tempo_restante -= 1;
+
+            uint8_t minutos  = tempo_restante / 60;
+            uint8_t segundos = tempo_restante % 60;
+
+            lcd.setCursor(0, 0);
+            lcd.print(F("Tempo restante: "));
+            lcd.print(minutos);
+            lcd.print(':');
+            if (segundos < 10) {
+                lcd.print('0');
+            }
+            lcd.print(segundos);
+            flag_1s = 0;
+        }
+    }
+
+    if (tempo_restante <= 0 || vidas_totais == 0) {
+        TCCR2B = 0; // Desliga o Timer2
+        desenhar_explosao();
+        delay(5000);
+        estado_atual = 255;
+    }
+}
+
+//              ============== MODULO RESISTOR ==============
+void jogo_resistor(uint16_t valor) {
+    if (flag_botao_apertado == 1) {
+        if (valor > LIMITE_INFERIOR && valor < LIMITE_SUPERIOR) {
+            resistor_correto = 1;
+            lcd.clear();
+            lcd.setCursor(0, 2);
+            lcd.print(F("PARABENS            "));
+            lcd.setCursor(0, 3);
+            lcd.print(F("resistor correto    "));
+        } else {
+            lcd.clear();
+            lcd.setCursor(0, 1);
+            lcd.print(F("-10s                "));
+            lcd.setCursor(0, 2);
+            lcd.print(F("ERRO                "));
+            lcd.setCursor(0, 3);
+            lcd.print(F("resistor errado     "));
+            tempo_restante -= 10;
+        }
+        flag_botao_apertado = 0;
+    }
+}
+
+//              ============== MODULO ENIGMAS ==============
+uint8_t chaves_ativas[25] = {
+    4,  7,  8,  11, 12, 13, 15, 19, 21, 22, 23, 24,
+    27, 33, 42, 50, 64, 66, 69, 73, 77, 84, 88, 90, 99
+};
+
+const char e4[]  PROGMEM = "O ano de lançamento de The College Dropout.";
+const char e7[]  PROGMEM = "Os pecados capitais; as vidas de um gato na crendice popular.";
+const char e8[]  PROGMEM = "O número que, deitado, vira o símbolo do infinito.";
+const char e11[] PROGMEM = "O volume levado até onde não dá mais no clássico falso documentário de rock (Spinal Tap).";
+const char e12[] PROGMEM = "Os cavaleiros de ouro do Zodíaco; os apóstolos.";
+const char e13[] PROGMEM = "O andar pulado em tantos prédios e aviões por superstição.";
+const char e15[] PROGMEM = "Os minutos de fama que Andy Warhol disse que todo mundo teria um dia.";
+const char e19[] PROGMEM = "O número que persegue Roland Deschain na jornada até a Torre Negra, de Stephen King.";
+const char e21[] PROGMEM = "O valor máximo que você busca na mesa de blackjack sem estourar.";
+const char e22[] PROGMEM = "O paradoxo de guerra que dá nome ao clássico de Joseph Heller (Catch-??).";
+const char e23[] PROGMEM = "Os minutos de duração da música 'Echoes', do Pink Floyd.";
+const char e24[] PROGMEM = "As horas de Jack Bauer em tempo real.";
+const char e27[] PROGMEM = "O clube triste dos músicos que morreram nessa idade.";
+const char e33[] PROGMEM = "A idade tradicionalmente atribuída a Cristo; um número mestre na numerologia.";
+const char e42[] PROGMEM = "A resposta para a Vida, o Universo e Tudo Mais no Guia do Mochileiro das Galáxias.";
+const char e50[] PROGMEM = "As bodas de ouro; o meio de um século.";
+const char e64[] PROGMEM = "As casas de um tabuleiro de xadrez; o pack cheio no inventário do Minecraft.";
+const char e66[] PROGMEM = "A famosa rota rodoviária americana imortalizada em músicas e viagens de estrada.";
+const char e69[] PROGMEM = "O símbolo clássico de dualidade e inversão na cultura pop e no humor.";
+const char e73[] PROGMEM = "O número favorito do Sheldon Cooper em The Big Bang Theory.";
+const char e77[] PROGMEM = "O número da sorte clássico em caça-níqueis e histórias de cassino.";
+const char e84[] PROGMEM = "O ano orwelliano em versão dobrada.";
+const char e88[] PROGMEM = "O total de teclas em um piano acústico completo.";
+const char e90[] PROGMEM = "Os graus de um canto reto perfeito ou de um quarto de volta.";
+const char e99[] PROGMEM = "Os problemas que Jay-Z diz ter, mas nenhum deles envolve a resposta.";
+// enigmas criados dentro da memoria flash
+
+const char* const dicionario_enigmas[100] PROGMEM = {
+    NULL, NULL, NULL, NULL, e4,   NULL, NULL, e7,   e8,   NULL,
+    NULL, e11,  e12,  e13,  NULL, e15,  NULL, NULL, NULL, e19,
+    NULL, e21,  e22,  e23,  e24,  NULL, NULL, e27,  NULL, NULL,
+    NULL, NULL, NULL, e33,  NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, e42,  NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    e50,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, e64,  NULL, e66,  NULL, NULL, e69,
+    NULL, NULL, NULL, e73,  NULL, NULL, NULL, e77,  NULL, NULL,
+    NULL, NULL, NULL, NULL, e84,  NULL, NULL, NULL, e88,  NULL,
+    e90,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, e99
+}; // dicionario dos enigmas utilizando os ponteiros para melhor legibilidade
+
+void embaralhar_enigmas() {
+    // 1. Cria a semente (seed) usando o ruído elétrico de um pino solto (ex: canal 2 / A2)
+    // Se não fizer isso, o Arduino sempre vai sortear os mesmos números toda vez que ligar.
+    randomSeed(meu_analogRead(2));
+
+    // 2. Algoritmo Fisher-Yates (Padrão da indústria para embaralhar listas)
+    // Percorre a lista de trás para frente trocando as posições aleatoriamente
+    for (int i = total_enigmas - 1; i > 0; i--) {
+        int j = random(0, i + 1); // Sorteia uma posição de 0 até i
+
+        // Troca os valores de lugar
+        uint8_t temporario = chaves_ativas[i];
+        chaves_ativas[i] = chaves_ativas[j];
+        chaves_ativas[j] = temporario;
+    }
+}
+
+void jogo_enigmas(uint16_t valor_pot) {
+    uint8_t numero = (valor_pot * 102L) / 1024;
+
+    lcd.setCursor(0, 3);
+    lcd.print(F("Resposta: "));
+
+    if (numero < 10) {
+        lcd.print('0');
+    }
+    lcd.print(numero);
+    lcd.print(F("       "));
+
+    if (flag_botao_apertado == 1) {
+        lcd.setCursor(0, 2);
+
+        if (numero == resposta_esperada) {
+            lcd.print(F("CORRETO             "));
+            lcd.setCursor(0, 3);
+            enigma_n++;
+
+            if (enigma_n <= limite_enig) {
+                lcd.print(F("Proximo enigma"));
+                delay(1000);
+                lcd.clear();
+                resposta_esperada = chaves_ativas[enigma_n - 1];
+                Serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
+                Serial.print(F("\n"));
+            }
+        } else {
+            erro_enigma += 1;
+            lcd.print(F("ERRADO              "));
+            lcd.setCursor(0, 3);
+            lcd.print(F("Tente novamente"));
+            lcd.setCursor(0, 1);
+            lcd.print(F("-15s       erro: "));
+            lcd.print(erro_enigma);
+            lcd.print(F("/3"));
+            tempo_restante -= 15;
+            delay(1000);
+
+            if (erro_enigma == 3) {
+                lcd.clear();
+                vidas_totais -= 1;
+                tempo_restante -= 2;
+                lcd.setCursor(0, 0);
+                lcd.print(vidas_totais);
+                lcd.print(F("/3 Vidas restantes "));
+                erro_enigma = 0;
+                delay(2000);
+            }
+            lcd.clear();
+        }
+
+        flag_botao_apertado = 0;
+    }
+}
+
+void desenhar_explosao() {
+    lcd.clear();
+
+    lcd.setCursor(0, 1);
+    lcd.print(F("        (**)        "));
+    lcd.setCursor(0, 2);
+    lcd.print(F("        (**)        "));
+    delay(180);
+
+    lcd.setCursor(0, 0);
+    lcd.print(F("      . (##) .      "));
+    lcd.setCursor(0, 1);
+    lcd.print(F("    * (######) *    "));
+    lcd.setCursor(0, 2);
+    lcd.print(F("      ' (##) '      "));
+    delay(180);
+
+    lcd.setCursor(0, 0);
+    lcd.print(F("  * .  (####)  . *  "));
+    lcd.setCursor(0, 1);
+    lcd.print(F(" * (( B O O M! )) * "));
+    lcd.setCursor(0, 2);
+    lcd.print(F("  * .  '|##|'  . *  "));
+    lcd.setCursor(0, 3);
+    lcd.print(F("== BOMBA EXPLODIU =="));
+
+    for (uint8_t i = 0; i < 3; i++) {
+        lcd.noBacklight();
+        delay(120);
+        lcd.backlight();
+        delay(120);
+    }
+
+    Serial.println();
+    Serial.println(F("           _.-^^---....,,--"));
+    Serial.println(F("       _--                  --_"));
+    Serial.println(F("      <                        >)"));
+    Serial.println(F("      |                         |"));
+    Serial.println(F("       \\._                   _./"));
+    Serial.println(F("          ```--. . , ; .--'''"));
+    Serial.println(F("                | |   |"));
+    Serial.println(F("             .-=||  | |=-."));
+    Serial.println(F("             `-=#$%&%$#=-'"));
+    Serial.println(F("                | ;  :|"));
+    Serial.println(F("       _____.,-#%&$@%#&#~,._____"));
+    Serial.println();
+    Serial.println(F("  ____     ____     ____    __  __   _ "));
+    Serial.println(F(" |  _ \\   / __ \\   / __ \\  |  \\/  | | |"));
+    Serial.println(F(" | |_) | | |  | | | |  | | | \\  / | | |"));
+    Serial.println(F(" |  _ <  | |  | | | |  | | | |\\/| | | |"));
+    Serial.println(F(" | |_) | | |__| | | |__| | | |  | | |_|"));
+    Serial.println(F(" |____/   \\____/   \\____/  |_|  |_| (_)"));
+    Serial.println();
+    Serial.println(F("           A BOMBA EXPLODIU!"));
+    Serial.println();
+}
+
+void desenhar_defuse() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("===================="));
+    lcd.setCursor(0, 1);
+    lcd.print(F("| BOMBA DESATIVADA |"));
+    lcd.setCursor(0, 2);
+    lcd.print(F("|  [ OK ]  SEGURO  |"));
+    lcd.setCursor(0, 3);
+    lcd.print(F("===================="));
+
+    Serial.println();
+    Serial.println(F("                         .---------------."));
+    Serial.println(F("                        /   ___________   \\"));
+    Serial.println(F("                       |   |        /  |   |"));
+    Serial.println(F("                       |   |       /   |   |"));
+    Serial.println(F("                       |   |  \\   /    |   |"));
+    Serial.println(F("                       |   |   \\_/     |   |"));
+    Serial.println(F("                       |    '---------'    |"));
+    Serial.println(F("                        \\                 /"));
+    Serial.println(F("                         '.             .'"));
+    Serial.println(F("                           '-.       .-'"));
+    Serial.println(F("                              '-----'"));
+    Serial.println();
+    Serial.println(F("  _____    ______   ______   _    _    _____   ______   _____    _ "));
+    Serial.println(F(" |  __ \\  |  ____| |  ____| | |  | |  / ____| |  ____| |  __ \\  | |"));
+    Serial.println(F(" | |  | | | |__    | |__    | |  | | | (___   | |__    | |  | | | |"));
+    Serial.println(F(" | |  | | |  __|   |  __|   | |  | |  \\___ \\  |  __|   | |  | | | |"));
+    Serial.println(F(" | |__| | | |____  | |      | |__| |  ____) | | |____  | |__| | |_|"));
+    Serial.println(F(" |_____/  |______| |_|       \\____/  |_____/  |______| |_____/  (_)"));
+    Serial.println();
+    Serial.println(F("                BOMBA DESATIVADA! MISSAO CUMPRIDA!"));
+    Serial.println();
+}
+
+void setup() {
+    MCUSR = 0;
+    wdt_disable(); // garante que o watchdog nao fique preso apos o reset
+
+    Serial.begin(9600);
+    for (uint8_t i = 0; i < 40; i++) {
+        Serial.println();
+    }
+
+    // ADC: liga e ajusta prescaler 128
+    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+
+    // pino 2 (botao INT0): entrada com pull-up interno
+    clr_bit(DDRD, PD2);
+    set_bit(PORTD, PD2);
+
+    // pinos A0 (potenciometro), A1 (resistor) e A2 (ruido): entrada sem pull-up
+    clr_bit(DDRC, PC0);
+    clr_bit(PORTC, PC0);
+    clr_bit(DDRC, PC1);
+    clr_bit(PORTC, PC1);
+    clr_bit(DDRC, PC2);
+    clr_bit(PORTC, PC2);
+
+    // desliga buffer digital nos canais analógicos usados
+    set_bit(DIDR0, ADC0D);
+    set_bit(DIDR0, ADC1D);
+    set_bit(DIDR0, ADC2D);
+
+    lcd.init();
+    lcd.backlight();
+
+    inicio_jogo();
+
+    cli();
+    clr_bit(EICRA, ISC00);
+    set_bit(EICRA, ISC01);
+    EIFR = (1 << INTF0);   // limpa qualquer flag pendente antes de habilitar INT0
+    set_bit(EIMSK, INT0);
+
+    // timer2 em modo CTC (1 ms)
+    TCCR2A = (1 << WGM21);
+    TCCR2B = 0;
+    TCNT2  = 0;
+    OCR2A  = 249;
+    TIMSK2 = (1 << OCIE2A);
+    TCCR2B = (1 << CS22);
+    sei();
+}
+
+void loop() {
+    tempo_display();
+
+    if (estado_atual == 0) {
+        if (printar_modulo != 0) {
+            Serial.println(F("\n=== FASE 1: DIVISOR DE TENSAO ==="));
+            Serial.println(F("Coloque o resistor e verifique no display sua resposta"));
+            lcd.setCursor(0, 2);
+            lcd.print(F("Fase 1: Resistor    "));
+            delay(1000);
+            lcd.setCursor(0, 2);
+            lcd.print(F("Aguardando          "));
+            lcd.setCursor(0, 3);
+            lcd.print(F("resistor            "));
+            printar_modulo = 0;
+        }
+
+        jogo_resistor(meu_analogRead(1));
+
+        if (resistor_correto) {
+            estado_atual++;
+            Serial.println(F("\nParabéns, passou para a próxima fase!"));
+            delay(1000);
+            flag_botao_apertado = 0;
+        }
+    } else if (estado_atual == 1) {
+        if (printar_modulo != 1) {
+            Serial.println(F("\n=== FASE 2: ENIGMAS ==="));
+            Serial.println(F("Gire o potenciômetro até o valor que corresponde ao enigma\n"));
+            lcd.clear();
+            lcd.setCursor(0, 2);
+            lcd.print(F("Iniciando fase 2    "));
+            delay(1000);
+            lcd.clear();
+
+            embaralhar_enigmas();
+            resposta_esperada = chaves_ativas[0];
+            Serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
+            Serial.println();
+            printar_modulo = 1;
+        }
+
+        jogo_enigmas(meu_analogRead(0));
+
+        if (enigma_n > limite_enig) {
+            TCCR2B = 0; // Desliga o Timer2
+            desenhar_defuse();
+            estado_atual = 255;
+            delay(5000);
+        }
+    }
+
+    if (estado_atual == 255) {
+        reset_jogo();
+    }
+}
