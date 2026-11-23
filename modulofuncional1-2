@@ -233,7 +233,7 @@ void jogo_enigmas(uint16_t valor_pot) {
                 lcd.clear();
                 resposta_esperada = chaves_ativas[enigma_n - 1];
                 Serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
-                Serial.print(F("\n"));
+                Serial.println();
             }
         } else {
             erro_enigma += 1;
