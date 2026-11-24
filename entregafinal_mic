@@ -11,7 +11,7 @@
 
 #define LIMITE_SUPERIOR 360
 #define LIMITE_INFERIOR 290
-r
+
 #define limite_enig   5
 #define total_enigmas 25
 #define limite_contas 10
@@ -180,7 +180,7 @@ void jogo_fios() {
         Serial.print(F("Valor lido do PINB: "));
         Serial.println(leitura_fios, BIN);
 
-        if (flag_botao_apertado == 1/*leitura_fios == combinacao_correta*/) {
+        if (leitura_fios == combinacao_correta) {
             fio_correto = 1;
             lcd.clear();
             lcd.setCursor(0, 2);
