@@ -22,7 +22,7 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 volatile uint8_t  flag_botao_apertado = 0;
 
 volatile uint32_t tempo_ms       = 0;
-int16_t           tempo_restante = 300; // em segundos
+int16_t           tempo_restante = 599; // em segundos
 
 uint8_t estado_atual   = 254;   // estado do modulo (0 a 3 = fases, 254 = inicio, 255 = fim)
 uint8_t printar_modulo = 255; // variavel para printar no monitor serial e display
@@ -796,6 +796,10 @@ void setup() {
     clr_bit(DDRD, PD2);
     set_bit(PORTD, PD2);
 
+    // pino 7 (PD7 - LED de vitoria): saida em LOW
+    set_bit(DDRD, PD7);
+    clr_bit(PORTD, PD7);
+
     // pinos A0 (potenciometro), A1 (resistor) e A2 (ruido): entrada sem pull-up
     clr_bit(DDRC, PC0);
     clr_bit(PORTC, PC0);
@@ -945,6 +949,7 @@ void loop() {
     tempo_display();
     verificar_derrota();
     if (estado_atual == 3 && conta_n > limite_contas) {
+        set_bit(PORTD, PD7); // acende o LED de vitoria
         buzzer_desligar();
         desenhar_defuse();
         estado_atual = 252;
