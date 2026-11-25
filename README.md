@@ -126,8 +126,8 @@ Como o desenvolvedor já conhece previamente as charadas dos fios, os enigmas e 
 
 ### Uso de Memória (preencher após compilação final)
 ```text
-Sketch usa 15128 bytes (46%) de espaço de armazenamento para programas. O máximo são 32256 bytes.
-Variáveis globais usam 494 bytes (24%) de memória dinâmica, deixando 1554 bytes para variáveis locais. O máximo são 2048 bytes.
+Sketch usa 17378 bytes (53%) de espaço de armazenamento para programas. O máximo são 32256 bytes.
+Variáveis globais usam 876 bytes (42%) de memória dinâmica, deixando 1172 bytes para variáveis locais. O máximo são 2048 bytes.
 ```
 
 ---
