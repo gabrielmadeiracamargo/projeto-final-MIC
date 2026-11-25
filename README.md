@@ -136,4 +136,5 @@ Variáveis globais usam 494 bytes (24%) de memória dinâmica, deixando 1554 byt
 
 * **Arthur Citron Ribas** — Arquitetura geral, Fases 2 e 3, gerenciamento de memória Flash, timers e integração.
 * **Gabriel Madeira Camargo** — Fase 4, conversores AD, protocolos de comunicação.
+* **Alexandre Eger Augusto** — Fase 1, Interrupções, Configuração de GPIO e Resistores internos
 * **Disciplina / Instituição:** *Arquitetura e Programação de Sistemas Microcontrolados (DAS5332) / UFSC*
