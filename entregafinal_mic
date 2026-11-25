@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <avr/wdt.h>
+#include <util/atomic.h>
 
 #define set_bit(reg, bit) ((reg) |= (1 << (bit)))
 #define clr_bit(reg, bit) ((reg) &= ~(1 << (bit)))
@@ -20,11 +21,10 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 volatile uint8_t  flag_botao_apertado = 0;
 
-volatile uint8_t  flag_1s        = 0;
 volatile uint32_t tempo_ms       = 0;
-int16_t           tempo_restante = 300; // em segundos
+int16_t           tempo_restante = 599; // em segundos
 
-uint8_t estado_atual   = 0;   // estado do modulo (0 = fios, 1 = resistor, 2 = enigmas, 255 = fim)
+uint8_t estado_atual   = 254;   // estado do modulo (0 a 3 = fases, 254 = inicio, 255 = fim)
 uint8_t printar_modulo = 255; // variavel para printar no monitor serial e display
 uint8_t vidas_totais   = 3;
 
@@ -42,7 +42,112 @@ uint8_t  numero_a         = 0;
 uint8_t  numero_b         = 0;
 uint16_t resultado_conta  = 0;
 uint16_t resposta_jogador = 0;
-uint8_t  digitando        = 0;
+uint8_t  digitando        = 0; // quantidade de digitos recebidos
+uint8_t entrada_invalida = 0;
+uint8_t ignorar_lf = 0;
+uint8_t linha_fora_da_hora = 0;
+
+// Controle dos intervalos, sem delay().
+enum { SEM_ESPERA, INTRO, AVANCAR, FIO_ERRO, FIO_VIDAS,
+       RES_ERRO, ENIG_ACERTO, ENIG_ERRO, ENIG_VIDAS,
+       CONTA_ACERTO, CONTA_ERRO, CONTA_VIDAS };
+uint8_t espera = SEM_ESPERA;
+uint32_t inicio_espera = 0;
+uint16_t duracao_espera = 0;
+uint32_t marco_segundo = 0;
+uint32_t inicio_buzzer = 0;
+uint8_t buzzer_ativo = 0;
+uint8_t etapa_explosao = 0;
+uint32_t marco_explosao = 0;
+int16_t ultimo_tempo_exibido = -1;
+uint8_t resistor_na_faixa = 0;
+uint8_t numero_pot = 0;
+uint8_t pot_iniciado = 0;
+uint8_t ultimo_numero = 255;
+
+// Saida serial: preserva os textos e evita esperar o buffer da UART esvaziar.
+// Cada item guarda apenas um ponteiro para a Flash ou um numero.
+class SaidaSerial {
+    struct Item {
+        const char* texto;
+        uint16_t numero;
+        uint8_t tipo, base, quebra;
+    };
+    static const uint8_t TAM = 48;
+    Item fila[TAM];
+    uint8_t inicio = 0, fim = 0, total = 0, perdeu = 0;
+
+    void inserir(const char* texto, uint16_t numero, uint8_t tipo,
+                 uint8_t base, uint8_t quebra) {
+        if (total == TAM) { perdeu = 1; return; }
+        fila[fim] = {texto, numero, tipo, base, quebra};
+        fim = (fim + 1) % TAM;
+        total++;
+    }
+public:
+    void print(const __FlashStringHelper* texto) { inserir((const char*)texto, 0, 0, 10, 0); }
+    void println(const __FlashStringHelper* texto) { inserir((const char*)texto, 0, 0, 10, 1); }
+    void print(uint16_t numero) { inserir(NULL, numero, 1, 10, 0); }
+    void println(uint16_t numero, uint8_t base = 10) { inserir(NULL, numero, 1, base, 1); }
+    void print(char c) { inserir(NULL, c, 2, 10, 0); }
+    void print(uint8_t numero) { print((uint16_t)numero); }
+    void print(int numero) { print((uint16_t)numero); }
+    void println() { println(F("")); }
+    void atualizar() {
+        for (uint8_t i = 0; i < 16 && total && Serial.availableForWrite() > 0; i++) {
+            Item &m = fila[inicio];
+            if (m.tipo == 0) {
+                char c = pgm_read_byte(m.texto);
+                if (c) { Serial.write((uint8_t)c); m.texto++; continue; }
+                m.tipo = 3;
+            } else if (m.tipo == 1) {
+                if (Serial.availableForWrite() < 16) return;
+                Serial.print(m.numero, m.base);
+                m.tipo = 3;
+            } else if (m.tipo == 2) {
+                Serial.write((uint8_t)m.numero);
+                m.tipo = 3;
+            }
+            if (m.quebra) {
+                if (Serial.availableForWrite() < 2) return;
+                Serial.write('\r'); Serial.write('\n');
+            }
+            inicio = (inicio + 1) % TAM;
+            total--;
+        }
+        if (perdeu && total < 16) {
+            perdeu = 0;
+            println(F("Aviso: fila serial cheia; houve perda de mensagens."));
+        }
+    }
+} saida_serial;
+
+void desenhar_explosao();
+void desenhar_defuse();
+void gerar_conta();
+void mostrar_conta();
+void atualizar_espera();
+
+uint32_t ler_tempo_ms() {
+    uint32_t copia;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { copia = tempo_ms; }
+    return copia;
+}
+
+uint8_t consumir_botao() {
+    uint8_t apertou;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        apertou = flag_botao_apertado;
+        flag_botao_apertado = 0;
+    }
+    return apertou;
+}
+
+void aguardar(uint8_t proxima_acao, uint16_t duracao) {
+    espera = proxima_acao;
+    inicio_espera = ler_tempo_ms();
+    duracao_espera = duracao;
+}
 
 ISR(INT0_vect) { // interrupcao para o botao de confirmacao
     static uint32_t ultimo_aperto_ms = 0;
@@ -53,16 +158,8 @@ ISR(INT0_vect) { // interrupcao para o botao de confirmacao
     }
 }
 
-ISR(TIMER2_COMPA_vect) { // roda a cada 1 ms exato, timer para o tempo do jogo
-    static uint16_t contador_ms = 0;
-
+ISR(TIMER2_COMPA_vect) { // roda a cada 1 ms exato
     tempo_ms++;
-    contador_ms++;
-
-    if (contador_ms >= 1000) {
-        contador_ms -= 1000;
-        flag_1s = 1;
-    }
 }
 
 uint16_t meu_analogRead(uint8_t canal) {
@@ -70,6 +167,25 @@ uint16_t meu_analogRead(uint8_t canal) {
     set_bit(ADCSRA, ADSC);         // começa a conversão
     while (tst_bit(ADCSRA, ADSC)); // espera terminar
     return ADC;                    // resultado: 0 a 1023
+}
+
+// Filtragem dos canais A0 e A1, mantendo meu_analogRead original.
+uint16_t leitura_filtrada(uint8_t canal) {
+    static uint16_t filtro[2] = {0, 0}; // ponto fixo: valor ADC vezes 16
+    static uint32_t ultima_amostra[2] = {0, 0};
+    static uint8_t iniciado[2] = {0, 0};
+    uint32_t agora = ler_tempo_ms();
+    if (!iniciado[canal] || agora - ultima_amostra[canal] >= 10) {
+        ultima_amostra[canal] = agora;
+        uint16_t alvo = meu_analogRead(canal) * 16U;
+        if (!iniciado[canal]) {
+            filtro[canal] = alvo;
+            iniciado[canal] = 1;
+        } else {
+            filtro[canal] += ((int16_t)alvo - (int16_t)filtro[canal]) / 4;
+        }
+    }
+    return (filtro[canal] + 8U) / 16U;
 }
 
 //              ============== BUZZER (TIMER1 - PINO 9 / PB1) ==============
@@ -87,69 +203,74 @@ void buzzer_desligar() {
     clr_bit(PORTB, PB1);
 }
 
-void inicio_jogo() { // para iniciar o jogo
-    Serial.println(F("Digite '&' armar a bomba:"));
-    lcd.setCursor(0,0);
-    lcd.print(F("Digite & para jogar:"));
-
-    while (1) {
-        if (Serial.available() > 0) {
-            char tecla = Serial.read();
-            if (tecla == '&') {
-                break;
-            }
+void inicio_jogo() { // chamado a cada loop, ate receber &
+    if (Serial.available() > 0) {
+        char tecla = Serial.read();
+        if (tecla == '&') {
+            marco_segundo = ler_tempo_ms();
+            consumir_botao();
+            estado_atual = 0;
+        } else if (tecla != '\r' && tecla != '\n') {
+            saida_serial.println(F("Entrada invalida. Digite &."));
         }
     }
 }
 
-void reset_jogo() { // resetar o jogo
-    Serial.println(F("Digite 'r' para resetar:"));
-
-    while (1) {
-        if (Serial.available() > 0) {
-            char tecla = Serial.read();
-            if (tecla == 'r' || tecla == 'R') {
-                wdt_enable(WDTO_15MS);
-                while (1);
-            }
+void reset_jogo() { // chamado a cada loop, ate receber r
+    if (Serial.available() > 0) {
+        char tecla = Serial.read();
+        if (tecla == 'r' || tecla == 'R') {
+            estado_atual = 251;
+            wdt_enable(WDTO_15MS);
+        } else if (tecla != '\r' && tecla != '\n') {
+            saida_serial.println(F("Entrada invalida. Digite r."));
         }
     }
 }
 
-void tempo_display() { // timer do tempo total do jogo
-    if (tempo_restante > 0) {
-        if (flag_1s) {
-            tempo_restante -= 1;
-
-            uint8_t minutos  = tempo_restante / 60;
-            uint8_t segundos = tempo_restante % 60;
-
-            lcd.setCursor(0, 0);
-            lcd.print(F("Tempo restante: "));
-            lcd.print(minutos);
-            lcd.print(':');
-            if (segundos < 10) {
-                lcd.print('0');
-            }
-            lcd.print(segundos);
-
-            if (tempo_restante <= 10 && tempo_restante > 0) {
-                buzzer_ligar(2000);
-                delay(100);
-                buzzer_desligar();
-            }
-
-            flag_1s = 0;
+void tempo_display() {
+    uint32_t agora = ler_tempo_ms();
+    uint32_t segundos_passados = (agora - marco_segundo) / 1000UL;
+    if (segundos_passados > 0) {
+        marco_segundo += segundos_passados * 1000UL;
+        if (tempo_restante > 0) {
+            if (segundos_passados >= (uint32_t)tempo_restante) tempo_restante = 0;
+            else tempo_restante -= segundos_passados;
+        }
+        if (tempo_restante <= 10 && tempo_restante > 0) {
+            buzzer_ligar(2000);
+            inicio_buzzer = ler_tempo_ms();
+            buzzer_ativo = 1;
         }
     }
-
-    if (tempo_restante <= 0 || vidas_totais == 0) {
-        TCCR2B = 0; // Desliga o Timer2
-        buzzer_ligar(500);
-        desenhar_explosao();
-        delay(5000);
+    if (buzzer_ativo && ler_tempo_ms() - inicio_buzzer >= 100) {
         buzzer_desligar();
-        estado_atual = 255;
+        buzzer_ativo = 0;
+    }
+
+    // Durante a mensagem de vidas, nao sobrescrever a primeira linha.
+    if (tempo_restante != ultimo_tempo_exibido &&
+        espera != FIO_VIDAS && espera != ENIG_VIDAS && espera != CONTA_VIDAS &&
+        tempo_restante > 0) {
+        uint8_t minutos  = tempo_restante / 60;
+        uint8_t segundos = tempo_restante % 60;
+        lcd.setCursor(0, 0);
+        lcd.print(F("Tempo restante: "));
+        lcd.print(minutos);
+        lcd.print(':');
+        if (segundos < 10) lcd.print('0');
+        lcd.print(segundos);
+        ultimo_tempo_exibido = tempo_restante;
+    }
+}
+
+void verificar_derrota() {
+    if (tempo_restante <= 0 || vidas_totais == 0) {
+        espera = SEM_ESPERA;
+        buzzer_ativo = 0;
+        buzzer_ligar(500);
+        etapa_explosao = 0;
+        estado_atual = 253;
     }
 }
 
@@ -160,74 +281,74 @@ void sortear_fio() {
 
     if (fio_a_ser_tirado == 0) {
         combinacao_correta = 0b00000100; // pino 10 (PB2)
-        Serial.println(F("Sou o sangue da fornalha e o sinal de que a linha foi cruzada. O meu tom avisa onde o perigo mora, mas se a pressa falar mais alto do que a razão, a contagem regressiva silencia para sempre. Não sou o começo, mas sou o centro de toda a cautela."));
+        saida_serial.println(F("Sou o sangue da fornalha e o sinal de que a linha foi cruzada. O meu tom avisa onde o perigo mora, mas se a pressa falar mais alto do que a razão, a contagem regressiva silencia para sempre. Não sou o começo, mas sou o centro de toda a cautela."));
     } else if (fio_a_ser_tirado == 1) {
         combinacao_correta = 0b00001000; // pino 11 (PB3)
-        Serial.println(F("Brilho com a intensidade de uma estrela distante, mas não trago o calor do fogo. Aviso sobre o perigo antes que ele se torne fatal, como a centelha que antecede a tempestade. Estou entre o extremo da energia e a calmaria da terra."));
+        saida_serial.println(F("Brilho com a intensidade de uma estrela distante, mas não trago o calor do fogo. Aviso sobre o perigo antes que ele se torne fatal, como a centelha que antecede a tempestade. Estou entre o extremo da energia e a calmaria da terra."));
     } else if (fio_a_ser_tirado == 2) {
         combinacao_correta = 0b00010000; // pino 12 (PB4)
-        Serial.println(F("Nasço do encontro entre a paixão e a luz do dia, mas não pertenço totalmente a nenhuma delas. Sou o entardecer congelado em metal, o crepúsculo que avisa que o tempo está mudando. Quem busca o equilíbrio perfeito me encontra no meio do caminho."));
+        saida_serial.println(F("Nasço do encontro entre a paixão e a luz do dia, mas não pertenço totalmente a nenhuma delas. Sou o entardecer congelado em metal, o crepúsculo que avisa que o tempo está mudando. Quem busca o equilíbrio perfeito me encontra no meio do caminho."));
     } else if (fio_a_ser_tirado == 3) {
         combinacao_correta = 0b00100000; // pino 13 (PB5)
-        Serial.println(F("Visto o manto da meia-noite antes que a escuridão tome conta de tudo. Sou o enigma que os reis e os alquimistas guardavam em segredo, uma mistura profunda que desafia a lógica dos opostos. Quem me desvendar, precisará olhar além do óbvio."));
+        saida_serial.println(F("Visto o manto da meia-noite antes que a escuridão tome conta de tudo. Sou o enigma que os reis e os alquimistas guardavam em segredo, uma mistura profunda que desafia a lógica dos opostos. Quem me desvendar, precisará olhar além do óbvio."));
     }
 }
 
 void jogo_fios() {
-    if (flag_botao_apertado == 1) {
+    if (consumir_botao()) {
         uint8_t leitura_fios = PINB & 0b00111100;
 
-        Serial.print(F("Valor lido do PINB: "));
-        Serial.println(leitura_fios, BIN);
+        saida_serial.print(F("Valor lido do PINB: "));
+        saida_serial.println(leitura_fios, BIN);
 
         if (leitura_fios == combinacao_correta) {
             fio_correto = 1;
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 2);
             lcd.print(F("PARABENS            "));
             lcd.setCursor(0, 3);
             lcd.print(F("fio correto         "));
-            Serial.println(F("Acertou"));
+            saida_serial.println(F("Acertou"));
         } else {
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 1);
             lcd.print(F("-60s                "));
             lcd.setCursor(0, 2);
             lcd.print(F("ERRO                "));
             lcd.setCursor(0, 3);
             lcd.print(F("fio errado          "));
-            Serial.println(F("Errou"));
-            Serial.println(F("Reconecte o fio"));
+            saida_serial.println(F("Errou"));
+            saida_serial.println(F("Reconecte o fio"));
             tempo_restante -= 60;
             vidas_totais -= 1;
-            delay(1500);
-            lcd.setCursor(0, 0);
-            lcd.print(vidas_totais);
-            lcd.print(F("/3 Vidas restantes "));
-            delay(2000);
-            lcd.clear();
-            lcd.setCursor(0, 2);
-            lcd.print(F("Tente novamente     "));
-            lcd.setCursor(0, 3);
-            lcd.print(F("Reconecte o fio     "));
+            aguardar(FIO_ERRO, 1500);
         }
-
-        flag_botao_apertado = 0;
     }
 }
 
 //              ============== MODULO RESISTOR ==============
 void jogo_resistor(uint16_t valor) {
-    if (flag_botao_apertado == 1) {
-        if (valor > LIMITE_INFERIOR && valor < LIMITE_SUPERIOR) {
+    // Histerese: entra na faixa com margem de 5; sai nos limites originais.
+    if (resistor_na_faixa) {
+        if (valor <= LIMITE_INFERIOR || valor >= LIMITE_SUPERIOR)
+            resistor_na_faixa = 0;
+    } else if (valor > LIMITE_INFERIOR + 5 && valor < LIMITE_SUPERIOR - 5) {
+        resistor_na_faixa = 1;
+    }
+    if (consumir_botao()) {
+        if (resistor_na_faixa) {
             resistor_correto = 1;
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 2);
             lcd.print(F("PARABENS            "));
             lcd.setCursor(0, 3);
             lcd.print(F("resistor correto    "));
         } else {
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 1);
             lcd.print(F("-10s                "));
             lcd.setCursor(0, 2);
@@ -235,12 +356,8 @@ void jogo_resistor(uint16_t valor) {
             lcd.setCursor(0, 3);
             lcd.print(F("resistor errado     "));
             tempo_restante -= 10;
-            delay(1000);
-            lcd.clear();
-            lcd.setCursor(0, 2);
-            lcd.print(F("Tente novamente     "));
+            aguardar(RES_ERRO, 1000);
         }
-        flag_botao_apertado = 0;
     }
 }
 
@@ -259,7 +376,7 @@ const char e13[] PROGMEM = "O andar pulado em tantos prédios e aviões por supe
 const char e15[] PROGMEM = "Os minutos de fama que Andy Warhol disse que todo mundo teria um dia.";
 const char e19[] PROGMEM = "O número que persegue Roland Deschain na jornada até a Torre Negra, de Stephen King.";
 const char e21[] PROGMEM = "O valor máximo que você busca na mesa de blackjack sem estourar.";
-const char e22[] PROGMEM = "O paradoxo de guerra que dá nome ao clássico de Joseph Heller (Catch-??).";
+const char e22[] PROGMEM = "O paradoxo de guerra que dá nome ao clássico de Joseph Heller (Catch-?" "?).";
 const char e23[] PROGMEM = "Os minutos de duração da música 'Echoes', do Pink Floyd.";
 const char e24[] PROGMEM = "As horas de Jack Bauer em tempo real.";
 const char e27[] PROGMEM = "O clube triste dos músicos que morreram nessa idade.";
@@ -305,20 +422,35 @@ void embaralhar_enigmas() {
 
 void jogo_enigmas(uint16_t valor_pot) {
     uint8_t numero = (valor_pot * 103L) / 1024;
+    if (numero > 99) numero = 99;
 
-    lcd.setCursor(0, 3);
-    lcd.print(F("Resposta: "));
-
-    if (numero < 10) {
-        lcd.print('0');
+    // Mantem o mapeamento original (103/1024) e acrescenta margem de 2 ADC.
+    if (!pot_iniciado) {
+        numero_pot = numero;
+        pot_iniciado = 1;
+    } else if (numero > numero_pot) {
+        uint16_t limite = (numero * 1024UL + 102) / 103;
+        numero_pot = (valor_pot >= limite + 2) ? numero : numero - 1;
+    } else if (numero < numero_pot) {
+        uint16_t limite = ((numero + 1) * 1024UL + 102) / 103;
+        numero_pot = (valor_pot + 2 < limite) ? numero : numero + 1;
     }
-    if (numero > 99) {
-        numero = 99;
-    }
-    lcd.print(numero);
-    lcd.print(F("       "));
+    numero = numero_pot;
 
-    if (flag_botao_apertado == 1) {
+    // Atualiza apenas quando muda, evitando reescrever o LCD continuamente.
+    if (numero != ultimo_numero) {
+        ultimo_numero = numero;
+        lcd.setCursor(0, 3);
+        lcd.print(F("Resposta: "));
+
+        if (numero < 10) {
+            lcd.print('0');
+        }
+        lcd.print(numero);
+        lcd.print(F("       "));
+    }
+
+    if (consumir_botao()) {
         lcd.setCursor(0, 2);
 
         if (numero == resposta_esperada) {
@@ -328,11 +460,7 @@ void jogo_enigmas(uint16_t valor_pot) {
 
             if (enigma_n <= limite_enig) {
                 lcd.print(F("Proximo enigma"));
-                delay(1000);
-                lcd.clear();
-                resposta_esperada = chaves_ativas[enigma_n - 1];
-                Serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
-                Serial.println();
+                aguardar(ENIG_ACERTO, 1000);
             }
         } else {
             erros += 1;
@@ -344,22 +472,12 @@ void jogo_enigmas(uint16_t valor_pot) {
             lcd.print(erros);
             lcd.print(F("/3"));
             tempo_restante -= 10;
-            delay(1000);
-
             if (erros == 3) {
-                lcd.clear();
                 vidas_totais -= 1;
                 tempo_restante -= 2;
-                lcd.setCursor(0, 0);
-                lcd.print(vidas_totais);
-                lcd.print(F("/3 Vidas restantes "));
-                erros = 0;
-                delay(2000);
             }
-            lcd.clear();
+            aguardar(ENIG_ERRO, 1000);
         }
-
-        flag_botao_apertado = 0;
     }
 }
 
@@ -389,21 +507,21 @@ void gerar_conta() {
 
     mostrar_conta();
 
-    Serial.println();
-    Serial.print(F("Conta "));
-    Serial.print(conta_n);
-    Serial.print('/');
-    Serial.println(limite_contas);
+    saida_serial.println();
+    saida_serial.print(F("Conta "));
+    saida_serial.print(conta_n);
+    saida_serial.print('/');
+    saida_serial.println(limite_contas);
 
-    Serial.print(numero_a);
-    Serial.print(F(" + "));
-    Serial.print(numero_b);
-    Serial.println(F(" = ?"));
+    saida_serial.print(numero_a);
+    saida_serial.print(F(" + "));
+    saida_serial.print(numero_b);
+    saida_serial.println(F(" = ?"));
 }
 
 void checar_conta() {
-    if (resposta_jogador == resultado_conta) {
-        Serial.println(F("Correto!"));
+    if (!entrada_invalida && resposta_jogador == resultado_conta) {
+        saida_serial.println(F("Correto!"));
 
         lcd.setCursor(0, 2);
         lcd.print(F("CORRETO             "));
@@ -413,11 +531,10 @@ void checar_conta() {
         if (conta_n <= limite_contas) {
             lcd.setCursor(0, 3);
             lcd.print(F("Proxima conta       "));
-            delay(1000);
-            gerar_conta();
+            aguardar(CONTA_ACERTO, 1000);
         }
     } else {
-        Serial.println(F("Incorreto! -15 segundos"));
+        saida_serial.println(F("Incorreto! -15 segundos"));
 
         erros += 1;
         lcd.setCursor(0, 1);
@@ -429,105 +546,190 @@ void checar_conta() {
         lcd.setCursor(0, 3);
         lcd.print(F("Tente novamente     "));
         tempo_restante -= 15;
-        delay(1000);
-
         if (erros == 3) {
-            lcd.clear();
             vidas_totais -= 1;
             tempo_restante -= 2;
-            lcd.setCursor(0, 0);
-            lcd.print(vidas_totais);
-            lcd.print(F("/3 Vidas restantes "));
-            erros = 0;
-            delay(2000);
-        }    
-
-        if (tempo_restante > 0) {
-            mostrar_conta();
         }
+        aguardar(CONTA_ERRO, 1000);
     }
 }
 
 void jogo_matematica() {
-    while (Serial.available() > 0) {
-        char entrada = Serial.read();
-
-        if (entrada >= '0' && entrada <= '9') {
-            if (resposta_jogador < 1000) {
-                resposta_jogador = (resposta_jogador * 10) + (entrada - '0');
-                digitando = 1;
+    // Le apenas um caractere por passagem, sem esperar pelo restante da linha.
+    if (Serial.available() <= 0) return;
+    char entrada = Serial.read();
+    if (entrada == '\n' && ignorar_lf) { ignorar_lf = 0; return; }
+    ignorar_lf = (entrada == '\r');
+    if (entrada == '\n' || entrada == '\r') {
+        if (!linha_fora_da_hora) {
+            if (digitando == 0) entrada_invalida = 1;
+            if (entrada_invalida) {
+                saida_serial.println(F("Entrada invalida. Digite de 1 a 3 algarismos."));
+            } else {
+                saida_serial.print(F("Resposta: "));
+                saida_serial.println(resposta_jogador);
             }
-        } else if (entrada == '\n' || entrada == '\r') {
-            if (digitando == 1) {
-                Serial.print(F("Resposta: "));
-                Serial.println(resposta_jogador);
-
-                checar_conta();
-
-                resposta_jogador = 0;
-                digitando        = 0;
-                break;
-            }
+            checar_conta();
+        }
+        resposta_jogador = 0;
+        digitando = 0;
+        entrada_invalida = 0;
+        linha_fora_da_hora = 0;
+    } else if (!linha_fora_da_hora) {
+        if (entrada >= '0' && entrada <= '9' && digitando < 3) {
+            resposta_jogador = resposta_jogador * 10 + (entrada - '0');
+            digitando++;
+        } else {
+            entrada_invalida = 1;
         }
     }
 }
 
+// Respostas enviadas durante a troca de telas nao viram respostas da proxima conta.
+void entrada_fora_da_hora() {
+    if (Serial.available() <= 0) return;
+    char entrada = Serial.read();
+    if (entrada == '\n' && ignorar_lf) { ignorar_lf = 0; return; }
+    ignorar_lf = (entrada == '\r');
+    if (!linha_fora_da_hora && (estado_atual == 3 || (entrada != '\r' && entrada != '\n')))
+        saida_serial.println(F("Entrada fora de hora. Aguarde a proxima pergunta."));
+    linha_fora_da_hora = (entrada != '\r' && entrada != '\n');
+    resposta_jogador = 0;
+    digitando = 0;
+    entrada_invalida = 0;
+}
+
+void atualizar_espera() {
+    if (espera == SEM_ESPERA || ler_tempo_ms() - inicio_espera < duracao_espera) return;
+    uint8_t acao = espera;
+    espera = SEM_ESPERA;
+    if (acao == INTRO) {
+        if (estado_atual == 0 || estado_atual == 1) {
+            lcd.setCursor(0, 2);
+            lcd.print(F("Aguardando          "));
+            lcd.setCursor(0, 3);
+            if (estado_atual == 0) lcd.print(F("fio                 "));
+            else lcd.print(F("resistor            "));
+        } else if (estado_atual == 2) {
+            lcd.clear();
+            embaralhar_enigmas();
+            resposta_esperada = chaves_ativas[0];
+            saida_serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
+            saida_serial.println();
+            ultimo_numero = 255;
+        } else if (estado_atual == 3) {
+            lcd.clear();
+            randomSeed(meu_analogRead(2));
+            gerar_conta();
+        }
+    } else if (acao == AVANCAR) {
+        estado_atual++;
+    } else if (acao == FIO_ERRO) {
+        lcd.setCursor(0, 0);
+        lcd.print(vidas_totais);
+        lcd.print(F("/3 Vidas restantes "));
+        aguardar(FIO_VIDAS, 2000);
+    } else if (acao == FIO_VIDAS) {
+        lcd.clear();
+        lcd.setCursor(0, 2);
+        lcd.print(F("Tente novamente     "));
+        lcd.setCursor(0, 3);
+        lcd.print(F("Reconecte o fio     "));
+    } else if (acao == RES_ERRO) {
+        lcd.clear();
+        lcd.setCursor(0, 2);
+        lcd.print(F("Tente novamente     "));
+    } else if (acao == ENIG_ACERTO) {
+        lcd.clear();
+        resposta_esperada = chaves_ativas[enigma_n - 1];
+        saida_serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
+        saida_serial.println();
+        ultimo_numero = 255;
+    } else if (acao == ENIG_ERRO || acao == CONTA_ERRO) {
+        if (erros == 3) {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print(vidas_totais);
+            lcd.print(F("/3 Vidas restantes "));
+            erros = 0;
+            aguardar(acao == ENIG_ERRO ? ENIG_VIDAS : CONTA_VIDAS, 2000);
+        } else if (acao == ENIG_ERRO) {
+            lcd.clear();
+            ultimo_numero = 255;
+        } else mostrar_conta();
+    } else if (acao == ENIG_VIDAS) {
+        lcd.clear();
+        ultimo_numero = 255;
+    } else if (acao == CONTA_VIDAS) {
+        lcd.clear();
+        mostrar_conta();
+    } else if (acao == CONTA_ACERTO) {
+        gerar_conta();
+    }
+    ultimo_tempo_exibido = -1;
+}
+
 //              ============== ARTES FINAIS ==============
 void desenhar_explosao() {
-    lcd.clear();
+    uint32_t agora = ler_tempo_ms();
+    if (etapa_explosao == 0) {
+        lcd.clear();
 
-    lcd.setCursor(0, 1);
-    lcd.print(F("        (**)        "));
-    lcd.setCursor(0, 2);
-    lcd.print(F("        (**)        "));
-    delay(180);
+        lcd.setCursor(0, 1);
+        lcd.print(F("        (**)        "));
+        lcd.setCursor(0, 2);
+        lcd.print(F("        (**)        "));
+    } else if (etapa_explosao == 1 && agora - marco_explosao >= 180) {
+        lcd.setCursor(0, 0);
+        lcd.print(F("      . (##) .      "));
+        lcd.setCursor(0, 1);
+        lcd.print(F("    * (######) *    "));
+        lcd.setCursor(0, 2);
+        lcd.print(F("      ' (##) '      "));
+    } else if (etapa_explosao == 2 && agora - marco_explosao >= 180) {
+        lcd.setCursor(0, 0);
+        lcd.print(F("  * .  (####)  . *  "));
+        lcd.setCursor(0, 1);
+        lcd.print(F(" * (( B O O M! )) * "));
+        lcd.setCursor(0, 2);
+        lcd.print(F("  * .  '|##|'  . *  "));
+        lcd.setCursor(0, 3);
+        lcd.print(F("== BOMBA EXPLODIU =="));
 
-    lcd.setCursor(0, 0);
-    lcd.print(F("      . (##) .      "));
-    lcd.setCursor(0, 1);
-    lcd.print(F("    * (######) *    "));
-    lcd.setCursor(0, 2);
-    lcd.print(F("      ' (##) '      "));
-    delay(180);
-
-    lcd.setCursor(0, 0);
-    lcd.print(F("  * .  (####)  . *  "));
-    lcd.setCursor(0, 1);
-    lcd.print(F(" * (( B O O M! )) * "));
-    lcd.setCursor(0, 2);
-    lcd.print(F("  * .  '|##|'  . *  "));
-    lcd.setCursor(0, 3);
-    lcd.print(F("== BOMBA EXPLODIU =="));
-
-    for (uint8_t i = 0; i < 3; i++) {
-        lcd.noBacklight();
-        delay(120);
-        lcd.backlight();
-        delay(120);
-    }
-
-    Serial.println();
-    Serial.println(F("           _.-^^---....,,--"));
-    Serial.println(F("       _--                  --_"));
-    Serial.println(F("      <                        >)"));
-    Serial.println(F("      |                         |"));
-    Serial.println(F("       \\._                   _./"));
-    Serial.println(F("          ```--. . , ; .--'''"));
-    Serial.println(F("                | |   |"));
-    Serial.println(F("             .-=||  | |=-."));
-    Serial.println(F("             `-=#$%&%$#=-'"));
-    Serial.println(F("                | ;  :|"));
-    Serial.println(F("       _____.,-#%&$@%#&#~,._____"));
-    Serial.println();
-    Serial.println(F("  ____     ____     ____    __  __   _ "));
-    Serial.println(F(" |  _ \\   / __ \\   / __ \\  |  \\/  | | |"));
-    Serial.println(F(" | |_) | | |  | | | |  | | | \\  / | | |"));
-    Serial.println(F(" |  _ <  | |  | | | |  | | | |\\/| | | |"));
-    Serial.println(F(" | |_) | | |__| | | |__| | | |  | | |_|"));
-    Serial.println(F(" |____/   \\____/   \\____/  |_|  |_| (_)"));
-    Serial.println();
-    Serial.println(F("           A BOMBA EXPLODIU!"));
-    Serial.println();
+    } else if (etapa_explosao >= 3 && etapa_explosao <= 8 && (etapa_explosao == 3 || agora - marco_explosao >= 120)) {
+        if (etapa_explosao % 2) lcd.noBacklight();
+        else lcd.backlight();
+    } else if (etapa_explosao == 9 && agora - marco_explosao >= 120) {
+        saida_serial.println();
+        saida_serial.println(F("           _.-^^---....,,--"));
+        saida_serial.println(F("       _--                  --_"));
+        saida_serial.println(F("      <                        >)"));
+        saida_serial.println(F("      |                         |"));
+        saida_serial.println(F("       \\._                   _./"));
+        saida_serial.println(F("          ```--. . , ; .--'''"));
+        saida_serial.println(F("                | |   |"));
+        saida_serial.println(F("             .-=||  | |=-."));
+        saida_serial.println(F("             `-=#$%&%$#=-'"));
+        saida_serial.println(F("                | ;  :|"));
+        saida_serial.println(F("       _____.,-#%&$@%#&#~,._____"));
+        saida_serial.println();
+        saida_serial.println(F("  ____     ____     ____    __  __   _ "));
+        saida_serial.println(F(" |  _ \\   / __ \\   / __ \\  |  \\/  | | |"));
+        saida_serial.println(F(" | |_) | | |  | | | |  | | | \\  / | | |"));
+        saida_serial.println(F(" |  _ <  | |  | | | |  | | | |\\/| | | |"));
+        saida_serial.println(F(" | |_) | | |__| | | |__| | | |  | | |_|"));
+        saida_serial.println(F(" |____/   \\____/   \\____/  |_|  |_| (_)"));
+        saida_serial.println();
+        saida_serial.println(F("           A BOMBA EXPLODIU!"));
+        saida_serial.println();
+    } else if (etapa_explosao == 10 && agora - marco_explosao >= 5000) {
+        buzzer_desligar();
+        estado_atual = 255;
+        saida_serial.println(F("Digite 'r' para resetar:"));
+        return;
+    } else return;
+    etapa_explosao++;
+    marco_explosao = ler_tempo_ms();
 }
 
 void desenhar_defuse() {
@@ -541,29 +743,30 @@ void desenhar_defuse() {
     lcd.setCursor(0, 3);
     lcd.print(F("===================="));
 
-    Serial.println();
-    Serial.println(F("                         .---------------."));
-    Serial.println(F("                        /   ___________   \\"));
-    Serial.println(F("                       |   |        /  |   |"));
-    Serial.println(F("                       |   |       /   |   |"));
-    Serial.println(F("                       |   |  \\   /    |   |"));
-    Serial.println(F("                       |   |   \\_/     |   |"));
-    Serial.println(F("                       |    '---------'    |"));
-    Serial.println(F("                        \\                 /"));
-    Serial.println(F("                         '.             .'"));
-    Serial.println(F("                           '-.       .-'"));
-    Serial.println(F("                              '-----'"));
-    Serial.println();
-    Serial.println(F("  _____    ______   ______   _    _    _____   ______   _____    _ "));
-    Serial.println(F(" |  __ \\  |  ____| |  ____| | |  | |  / ____| |  ____| |  __ \\  | |"));
-    Serial.println(F(" | |  | | | |__    | |__    | |  | | | (___   | |__    | |  | | | |"));
-    Serial.println(F(" | |  | | |  __|   |  __|   | |  | |  \\___ \\  |  __|   | |  | | | |"));
-    Serial.println(F(" | |__| | | |____  | |      | |__| |  ____) | | |____  | |__| | |_|"));
-    Serial.println(F(" |_____/  |______| |_|       \\____/  |_____/  |______| |_____/  (_)"));
-    Serial.println();
-    Serial.println(F("                BOMBA DESATIVADA! MISSAO CUMPRIDA!"));
-    Serial.println();
+    saida_serial.println();
+    saida_serial.println(F("                         .---------------."));
+    saida_serial.println(F("                        /   ___________   \\"));
+    saida_serial.println(F("                       |   |        /  |   |"));
+    saida_serial.println(F("                       |   |       /   |   |"));
+    saida_serial.println(F("                       |   |  \\   /    |   |"));
+    saida_serial.println(F("                       |   |   \\_/     |   |"));
+    saida_serial.println(F("                       |    '---------'    |"));
+    saida_serial.println(F("                        \\                 /"));
+    saida_serial.println(F("                         '.             .'"));
+    saida_serial.println(F("                           '-.       .-'"));
+    saida_serial.println(F("                              '-----'"));
+    saida_serial.println();
+    saida_serial.println(F("  _____    ______   ______   _    _    _____   ______   _____    _ "));
+    saida_serial.println(F(" |  __ \\  |  ____| |  ____| | |  | |  / ____| |  ____| |  __ \\  | |"));
+    saida_serial.println(F(" | |  | | | |__    | |__    | |  | | | (___   | |__    | |  | | | |"));
+    saida_serial.println(F(" | |  | | |  __|   |  __|   | |  | |  \\___ \\  |  __|   | |  | | | |"));
+    saida_serial.println(F(" | |__| | | |____  | |      | |__| |  ____) | | |____  | |__| | |_|"));
+    saida_serial.println(F(" |_____/  |______| |_|       \\____/  |_____/  |______| |_____/  (_)"));
+    saida_serial.println();
+    saida_serial.println(F("                BOMBA DESATIVADA! MISSAO CUMPRIDA!"));
+    saida_serial.println();
 }
+
 
 void setup() {
     MCUSR = 0;
@@ -593,6 +796,10 @@ void setup() {
     clr_bit(DDRD, PD2);
     set_bit(PORTD, PD2);
 
+    // pino 7 (PD7 - LED de vitoria): saida em LOW
+    set_bit(DDRD, PD7);
+    clr_bit(PORTD, PD7);
+
     // pinos A0 (potenciometro), A1 (resistor) e A2 (ruido): entrada sem pull-up
     clr_bit(DDRC, PC0);
     clr_bit(PORTC, PC0);
@@ -611,7 +818,9 @@ void setup() {
 
     lcd.setCursor(0,2);
     lcd.print(F("Voce tem 3 vidas"));
-    inicio_jogo();
+    Serial.println(F("Digite '&' armar a bomba:"));
+    lcd.setCursor(0,0);
+    lcd.print(F("Digite & para jogar:"));
 
     cli();
     clr_bit(EICRA, ISC00);
@@ -630,120 +839,120 @@ void setup() {
 }
 
 void loop() {
+    if (estado_atual == 251) return;
+    saida_serial.atualizar(); // watchdog vai reiniciar
+    if (estado_atual == 254) { inicio_jogo(); return; }
+    if (estado_atual == 255) { reset_jogo(); return; }
+    if (estado_atual == 253) { entrada_fora_da_hora(); desenhar_explosao(); return; }
+    if (estado_atual == 252) {
+        entrada_fora_da_hora();
+        if (ler_tempo_ms() - inicio_espera >= 5000) {
+            estado_atual = 255;
+            saida_serial.println(F("Digite 'r' para resetar:"));
+        }
+        return;
+    }
+
     tempo_display();
+    verificar_derrota();
+    if (estado_atual == 253) return;
+
+    if (espera != SEM_ESPERA) {
+        if (estado_atual == 1) leitura_filtrada(1);
+        if (estado_atual == 2) leitura_filtrada(0);
+        if (consumir_botao()) saida_serial.println(F("Aguarde a proxima tela."));
+        entrada_fora_da_hora();
+        atualizar_espera();
+        return;
+    }
 
     // ============== FASE 1: FIOS ==============
     if (estado_atual == 0) {
         if (printar_modulo != 0) {
-            Serial.println(F("\n=== FASE 1: FIOS ==="));
-            Serial.println(F("Retire o fio correto e aperte o botao para confirmar:\n"));
+            saida_serial.println(F("\n=== FASE 1: FIOS ==="));
+            saida_serial.println(F("Retire o fio correto e aperte o botao para confirmar:\n"));
             sortear_fio();
-            Serial.println();
-
+            saida_serial.println();
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 2);
             lcd.print(F("Fase 1: Fios        "));
-            delay(1000);
-            lcd.setCursor(0, 2);
-            lcd.print(F("Aguardando          "));
-            lcd.setCursor(0, 3);
-            lcd.print(F("fio                 "));
             printar_modulo = 0;
+            aguardar(INTRO, 1000);
+            return;
         }
-
         jogo_fios();
-
         if (fio_correto) {
-            estado_atual++;
-            Serial.println(F("\nParabéns, passou para a próxima fase!"));
-            delay(1000);
-            flag_botao_apertado = 0;
+            saida_serial.println(F("\nParabéns, passou para a próxima fase!"));
+            aguardar(AVANCAR, 1000);
         }
     }
     // ============== FASE 2: RESISTOR ==============
     else if (estado_atual == 1) {
         if (printar_modulo != 1) {
-            Serial.println(F("\n=== FASE 2: DIVISOR DE TENSAO ==="));
-            Serial.println(F("Coloque o resistor e verifique no display sua resposta"));
+            saida_serial.println(F("\n=== FASE 2: DIVISOR DE TENSAO ==="));
+            saida_serial.println(F("Coloque o resistor e verifique no display sua resposta"));
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 2);
             lcd.print(F("Fase 2: Resistor    "));
-            delay(1000);
-            lcd.setCursor(0, 2);
-            lcd.print(F("Aguardando          "));
-            lcd.setCursor(0, 3);
-            lcd.print(F("resistor            "));
             printar_modulo = 1;
+            aguardar(INTRO, 1000);
+            return;
         }
-
-        jogo_resistor(meu_analogRead(1));
-
+        jogo_resistor(leitura_filtrada(1));
         if (resistor_correto) {
-            estado_atual++;
-            Serial.println(F("\nParabéns, passou para a próxima fase!"));
-            delay(1000);
-            flag_botao_apertado = 0;
+            saida_serial.println(F("\nParabéns, passou para a próxima fase!"));
+            aguardar(AVANCAR, 1000);
         }
     }
     // ============== FASE 3: ENIGMAS ==============
     else if (estado_atual == 2) {
         if (printar_modulo != 2) {
-            Serial.println(F("\n=== FASE 3: ENIGMAS ==="));
-            Serial.println(F("Gire o potenciômetro até o valor que corresponde ao enigma\n"));
+            saida_serial.println(F("\n=== FASE 3: ENIGMAS ==="));
+            saida_serial.println(F("Gire o potenciômetro até o valor que corresponde ao enigma\n"));
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 2);
             lcd.print(F("Iniciando fase 3    "));
-            delay(1000);
-            lcd.clear();
-
-            embaralhar_enigmas();
-            resposta_esperada = chaves_ativas[0];
-            Serial.println((const __FlashStringHelper*)pgm_read_word(&dicionario_enigmas[resposta_esperada]));
-            Serial.println();
             printar_modulo = 2;
+            aguardar(INTRO, 1000);
+            return;
         }
-
-        jogo_enigmas(meu_analogRead(0));
-
+        jogo_enigmas(leitura_filtrada(0));
         if (enigma_n > limite_enig) {
-            estado_atual++;
-            Serial.println(F("\nParabéns, passou para a última fase!"));
-            delay(1000);
-            flag_botao_apertado = 0;
+            saida_serial.println(F("\nParabéns, passou para a última fase!"));
+            aguardar(AVANCAR, 1000);
         }
     }
     // ============== FASE 4: MATEMATICA ==============
     else if (estado_atual == 3) {
         if (printar_modulo != 3) {
-            Serial.println(F("\n=== FASE 4: MATEMATICA ==="));
-            Serial.println(F("Resolva as contas e digite o resultado no Monitor Serial\n"));
+            saida_serial.println(F("\n=== FASE 4: MATEMATICA ==="));
+            saida_serial.println(F("Resolva as contas e digite o resultado no Monitor Serial\n"));
             lcd.clear();
+            ultimo_tempo_exibido = -1;
             lcd.setCursor(0, 2);
             lcd.print(F("Iniciando fase 4    "));
-            delay(1000);
-            lcd.clear();
-
-            while (Serial.available() > 0) {
-                Serial.read();
-            }
-
-            randomSeed(meu_analogRead(2));
-            gerar_conta();
             printar_modulo = 3;
+            aguardar(INTRO, 1000);
+            return;
         }
-
         jogo_matematica();
-
-        if (conta_n > limite_contas) {
-            TCCR2B = 0; // Desliga o Timer2
-            buzzer_desligar();
-            desenhar_defuse();
-            estado_atual = 255;
-            delay(5000);
-        }
     }
 
-    if (estado_atual == 255) {
-        reset_jogo();
+    if (estado_atual < 3) entrada_fora_da_hora();
+    else if (estado_atual == 3 && consumir_botao())
+        saida_serial.println(F("Responda pelo Monitor Serial."));
+
+    // Atualiza o tempo antes de decidir vitoria ou derrota.
+    tempo_display();
+    verificar_derrota();
+    if (estado_atual == 3 && conta_n > limite_contas) {
+        set_bit(PORTD, PD7); // acende o LED de vitoria
+        buzzer_desligar();
+        desenhar_defuse();
+        estado_atual = 252;
+        inicio_espera = ler_tempo_ms();
     }
 }
