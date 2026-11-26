@@ -4,9 +4,7 @@ Jogo interativo de desarme de bomba desenvolvido em C/C++ para **Arduino Uno R3*
 
 ## Fluxograma do Sistema
 
-<!-- Insira aqui a imagem do fluxograma final. Exemplo: ![Fluxograma do sistema](fluxograma.png) -->
-
-*Espaço reservado para o fluxograma da máquina de estados do firmware.*
+![Fluxograma do sistema](fluxograma.png)
 
 ---
 
